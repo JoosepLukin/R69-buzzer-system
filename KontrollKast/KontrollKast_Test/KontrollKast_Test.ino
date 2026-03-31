@@ -2,8 +2,8 @@
  * KontrollKast_Test.ino — Hardware test sketch for KontrollKast PCB (ESP32-S3)
  *
  * Tests:
- *   - ST7796 320×480 SPI display (TFT_eSPI library)
- *   - FT6336U capacitive touch (I2C, no extra library needed)
+ *   - ST7796 320×480 SPI display (Arduino_GFX_Library)
+ *   - FT6336U capacitive touch (I2C, direct register read)
  *   - 3× illuminated push-buttons + backlight MOSFETs
  *   - 433 MHz reception (RXB6 on GPIO 1, RCSwitch library)
  *   - RS-485 half-duplex (SN65HVD72, GPIO 4/5/6, ArduinoJson)
@@ -13,34 +13,33 @@
  * Board: ESP32S3 Dev Module
  *
  * Required libraries:
- *   - TFT_eSPI  (configure User_Setup.h — see KontrollKast/README.md)
+ *   - Arduino_GFX_Library (moononournation)
  *   - ArduinoJson v6
  *   - RCSwitch (by sui77)
- *
- * TFT_eSPI User_Setup.h key defines:
- *   #define ST7796_DRIVER
- *   #define TFT_CS 15, TFT_DC 17, TFT_RST 16
- *   #define TFT_MOSI 18, TFT_SCLK 8, TFT_MISO 9, TFT_BL 3
- *   #define SPI_FREQUENCY 27000000
  */
 
 #include <Wire.h>
-#include <TFT_eSPI.h>
+#include <Arduino_GFX_Library.h>
 #include <RCSwitch.h>
 #include <ArduinoJson.h>
 #include <HardwareSerial.h>
 
-// ─── Pin definitions ─────────────────────────────────────────────────────────
+// ─── Pin definitions ──────────────────────────────────────────────────────────
 #define PIN_433_DATA    1   // RXB6 data
-#define PIN_LCD_BL      3   // Backlight PWM (also defined in TFT_eSPI User_Setup.h)
+#define PIN_LCD_BL      3   // Backlight
 #define PIN_RS485_MODE  4   // DE/RE: HIGH=TX, LOW=RX
 #define PIN_RS485_TX    5
 #define PIN_RS485_RX    6
-// LCD SPI pins handled by TFT_eSPI via User_Setup.h
+#define TFT_SCLK        8
+#define TFT_MISO        9
 #define PIN_TOUCH_SCL  10
 #define PIN_TOUCH_RST  11
 #define PIN_TOUCH_SDA  12
 #define PIN_TOUCH_INT  13
+#define TFT_CS         15
+#define TFT_RST        16
+#define TFT_DC         17
+#define TFT_MOSI       18
 #define PIN_BTN1_BL    21   // Button 1 backlight MOSFET
 #define PIN_BTN2_BL    35   // Button 2 backlight MOSFET
 #define PIN_BTN2_IN    36   // Button 2 input (active LOW)
@@ -51,26 +50,37 @@
 // ─── FT6336U touch (I2C address 0x38) ────────────────────────────────────────
 #define FT6336U_ADDR  0x38
 
-// ─── RS-485 ──────────────────────────────────────────────────────────────────
+// ─── RS-485 ───────────────────────────────────────────────────────────────────
 HardwareSerial RS485(1);    // UART1
 #define RS485_BAUD  115200
 
-// ─── Display ─────────────────────────────────────────────────────────────────
-TFT_eSPI tft = TFT_eSPI();
+// ─── Display (Arduino_GFX_Library) ───────────────────────────────────────────
+Arduino_DataBus *bus = new Arduino_ESP32SPI(
+    TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI, TFT_MISO
+);
+Arduino_GFX *gfx = new Arduino_ST7796(
+    bus,
+    TFT_RST,
+    0,      // native rotation for init
+    true,   // IPS
+    320,    // native width
+    480     // native height
+);
+
 #define TFT_W 320
 #define TFT_H 480
 
 // Colour palette
-#define C_BG      TFT_BLACK
-#define C_HEADER  0x1A3A      // dark blue-green
-#define C_TEXT    TFT_WHITE
-#define C_GREEN   TFT_GREEN
-#define C_RED     TFT_RED
-#define C_YELLOW  TFT_YELLOW
-#define C_ORANGE  0xFD00      // orange
+#define C_BG      0x0000        // black
+#define C_HEADER  0x1A3A        // dark blue-green
+#define C_TEXT    0xFFFF        // white
+#define C_GREEN   0x07E0
+#define C_RED     0xF800
+#define C_YELLOW  0xFFE0
+#define C_ORANGE  0xFD00
 #define C_GRAY    0x7BEF
 
-// ─── 433 MHz ─────────────────────────────────────────────────────────────────
+// ─── 433 MHz ──────────────────────────────────────────────────────────────────
 RCSwitch rf433;
 bool pairingMode433 = false;
 
@@ -88,14 +98,31 @@ struct ScreenBtn {
 };
 
 static const ScreenBtn screenBtns[] = {
-    {  10, 310, 140, 50, "Blink All", C_ORANGE },
-    { 170, 310, 140, 50, "Stop All",  C_RED    },
-    {  10, 370, 140, 50, "Ping All",  C_GREEN  },
-    { 170, 370, 140, 50, "433 Pair",  C_YELLOW },
+    {  10, 310, 140, 50, "Blink All",  C_ORANGE },
+    { 170, 310, 140, 50, "Stop All",   C_RED    },
+    {  10, 370, 140, 50, "Ping All",   C_GREEN  },
+    { 170, 370, 140, 50, "433 Pair",   C_YELLOW },
+    {  10, 430, 300, 40, "RS485 Ping", C_GRAY   },
 };
-static const int NUM_SCREEN_BTNS = 4;
+static const int NUM_SCREEN_BTNS = 5;
 
-// ─── Status log (last 6 lines) ─────────────────────────────────────────────────
+// ─── Forward declarations ─────────────────────────────────────────────────────
+void touchBegin();
+bool touchRead(int16_t &x, int16_t &y);
+void drawUI();
+void redrawLog();
+void drawScreenBtns();
+void redrawBtnStatus();
+void rs485Send(const String &json);
+void sendRS485Ping();
+void handleRS485();
+void handleScreenTouch(int16_t x, int16_t y);
+void sendBlinkAll();
+void sendStopAll();
+void sendPingAll();
+void enter433Pairing();
+
+// ─── Status log (last 6 lines) ────────────────────────────────────────────────
 #define LOG_LINES 6
 String logLines[LOG_LINES];
 int    logHead = 0;
@@ -107,51 +134,39 @@ void logAdd(const String &s) {
     redrawLog();
 }
 
-// ─── Forward declarations ─────────────────────────────────────────────────────
-void touchBegin();
-bool touchRead(int16_t &x, int16_t &y);
-void drawUI();
-void redrawLog();
-void drawScreenBtns();
-void redrawBtnStatus();
-void rs485Send(const String &json);
-void handleRS485();
-void handleScreenTouch(int16_t x, int16_t y);
-void sendBlinkAll();
-void sendStopAll();
-void sendPingAll();
-void enter433Pairing();
-
-// ─── Setup ───────────────────────────────────────────────────────────────────
+// ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=== KontrollKast Test Sketch ===");
 
-    // ── Physical buttons & backlights ────────────────────────────────────────
+    // ── Physical buttons & backlights ─────────────────────────────────────────
     for (int i = 0; i < 3; i++) {
         pinMode(BTN_IN[i], INPUT_PULLUP);
         pinMode(BTN_BL[i], OUTPUT);
         digitalWrite(BTN_BL[i], LOW);
     }
 
-    // ── RS-485 ───────────────────────────────────────────────────────────────
+    // ── RS-485 ────────────────────────────────────────────────────────────────
     pinMode(PIN_RS485_MODE, OUTPUT);
     digitalWrite(PIN_RS485_MODE, LOW);  // receive mode
     RS485.begin(RS485_BAUD, SERIAL_8N1, PIN_RS485_RX, PIN_RS485_TX);
     Serial.println("RS-485 ready");
 
-    // ── 433 MHz ──────────────────────────────────────────────────────────────
+    // ── 433 MHz ───────────────────────────────────────────────────────────────
     rf433.enableReceive(PIN_433_DATA);
     Serial.println("433 MHz ready");
 
-    // ── Display ──────────────────────────────────────────────────────────────
-    tft.init();
-    tft.setRotation(0);   // portrait, USB at bottom — adjust if needed
-    tft.fillScreen(C_BG);
-    ledcSetup(0, 5000, 8);
-    ledcAttachPin(PIN_LCD_BL, 0);
-    ledcWrite(0, 200);    // ~78% brightness
+    // ── Display ───────────────────────────────────────────────────────────────
+    pinMode(PIN_LCD_BL, OUTPUT);
+    digitalWrite(PIN_LCD_BL, HIGH);
+
+    if (!gfx->begin()) {
+        Serial.println("ERROR: Display init failed — check wiring");
+        while (1) delay(100);
+    }
+    gfx->setRotation(0);   // portrait, USB at bottom
+    gfx->fillScreen(C_BG);
     Serial.println("Display ready");
 
     // ── Touch ─────────────────────────────────────────────────────────────────
@@ -167,12 +182,12 @@ void setup() {
     sendPingAll();
 }
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
+// ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-    // ── RS-485 incoming ──────────────────────────────────────────────────────
+    // ── RS-485 incoming ───────────────────────────────────────────────────────
     handleRS485();
 
-    // ── 433 MHz reception ────────────────────────────────────────────────────
+    // ── 433 MHz reception ─────────────────────────────────────────────────────
     if (rf433.available()) {
         unsigned long code = rf433.getReceivedValue();
         int bits           = rf433.getReceivedBitlength();
@@ -182,17 +197,15 @@ void loop() {
         logAdd(msg);
 
         if (pairingMode433) {
-            // Store/send paired code
             logAdd("Paired: " + String(code));
             pairingMode433 = false;
-            // Turn off LED indicator
             for (int i = 0; i < 3; i++) {
                 digitalWrite(BTN_BL[i], btnBl[i] ? HIGH : LOW);
             }
         }
     }
 
-    // ── Physical button handling ─────────────────────────────────────────────
+    // ── Physical button handling ───────────────────────────────────────────────
     for (int i = 0; i < 3; i++) {
         bool pressed = !digitalRead(BTN_IN[i]);  // active LOW
         if (pressed && !btnState[i]) {
@@ -203,7 +216,6 @@ void loop() {
             logAdd(msg);
             redrawBtnStatus();
 
-            // Button 1 → blink all, Button 2 → stop all, Button 3 → ping all
             if (i == 0) sendBlinkAll();
             if (i == 1) sendStopAll();
             if (i == 2) sendPingAll();
@@ -211,15 +223,16 @@ void loop() {
         if (!pressed) btnState[i] = false;
     }
 
-    // ── Touch handling ───────────────────────────────────────────────────────
+    // ── Touch handling ────────────────────────────────────────────────────────
     int16_t tx, ty;
     if (touchRead(tx, ty)) {
-        // Update live touch coords on screen
-        tft.fillRect(10, 270, 300, 30, C_BG);
-        tft.setTextColor(C_GRAY, C_BG);
-        tft.setTextSize(1);
-        tft.setCursor(10, 275);
-        tft.printf("Touch: X=%3d Y=%3d", tx, ty);
+        char buf[32];
+        gfx->fillRect(10, 270, 300, 30, C_BG);
+        gfx->setTextColor(C_GRAY, C_BG);
+        gfx->setTextSize(1);
+        gfx->setCursor(10, 275);
+        snprintf(buf, sizeof(buf), "Touch: X=%3d Y=%3d", tx, ty);
+        gfx->print(buf);
 
         handleScreenTouch(tx, ty);
         delay(80);  // simple debounce
@@ -236,7 +249,6 @@ void loop() {
 // ─── Touch (FT6336U, direct I2C) ─────────────────────────────────────────────
 void touchBegin() {
     Wire.begin(PIN_TOUCH_SDA, PIN_TOUCH_SCL);
-    // Hardware reset
     pinMode(PIN_TOUCH_RST, OUTPUT);
     digitalWrite(PIN_TOUCH_RST, LOW);  delay(10);
     digitalWrite(PIN_TOUCH_RST, HIGH); delay(100);
@@ -244,7 +256,6 @@ void touchBegin() {
 }
 
 bool touchRead(int16_t &x, int16_t &y) {
-    // Read 5 bytes starting at register 0x02 (TD_STATUS)
     Wire.beginTransmission(FT6336U_ADDR);
     Wire.write(0x02);
     Wire.endTransmission(false);
@@ -266,29 +277,29 @@ bool touchRead(int16_t &x, int16_t &y) {
 
 // ─── Display helpers ──────────────────────────────────────────────────────────
 void drawUI() {
-    tft.fillScreen(C_BG);
+    gfx->fillScreen(C_BG);
 
     // Header
-    tft.fillRect(0, 0, TFT_W, 45, C_HEADER);
-    tft.setTextColor(C_TEXT, C_HEADER);
-    tft.setTextSize(2);
-    tft.setCursor(10, 12);
-    tft.print("KontrollKast TEST");
+    gfx->fillRect(0, 0, TFT_W, 45, C_HEADER);
+    gfx->setTextColor(C_TEXT, C_HEADER);
+    gfx->setTextSize(2);
+    gfx->setCursor(10, 12);
+    gfx->print("KontrollKast TEST");
 
     // Section labels
-    tft.setTextColor(C_GRAY, C_BG);
-    tft.setTextSize(1);
-    tft.setCursor(10, 52);
-    tft.print("Physical buttons:");
+    gfx->setTextColor(C_GRAY, C_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(10, 52);
+    gfx->print("Physical buttons:");
 
-    tft.setCursor(10, 140);
-    tft.print("RS-485 / ESP-NOW log:");
+    gfx->setCursor(10, 140);
+    gfx->print("RS-485 / ESP-NOW log:");
 
-    tft.setCursor(10, 265);
-    tft.print("Touch coordinates:");
+    gfx->setCursor(10, 265);
+    gfx->print("Touch coordinates:");
 
-    tft.setCursor(10, 295);
-    tft.print("Commands:");
+    gfx->setCursor(10, 295);
+    gfx->print("Commands:");
 
     redrawBtnStatus();
     drawScreenBtns();
@@ -298,29 +309,30 @@ void drawUI() {
 void redrawBtnStatus() {
     for (int i = 0; i < 3; i++) {
         int xo = 10 + i * 105;
-        tft.fillRect(xo, 62, 95, 70, btnBl[i] ? C_GREEN : 0x2104);
-        tft.setTextColor(C_TEXT);
-        tft.setTextSize(2);
-        tft.setCursor(xo + 8, 72);
-        tft.printf("BTN%d", i+1);
-        tft.setTextSize(1);
-        tft.setCursor(xo + 8, 100);
-        tft.print(btnBl[i] ? "BL: ON " : "BL: OFF");
-        tft.setCursor(xo + 8, 115);
-        tft.print(btnState[i] ? "PRESSED" : "       ");
+        gfx->fillRect(xo, 62, 95, 70, btnBl[i] ? C_GREEN : 0x2104);
+        gfx->setTextColor(C_TEXT);
+        gfx->setTextSize(2);
+        gfx->setCursor(xo + 8, 72);
+        char buf[6];
+        snprintf(buf, sizeof(buf), "BTN%d", i+1);
+        gfx->print(buf);
+        gfx->setTextSize(1);
+        gfx->setCursor(xo + 8, 100);
+        gfx->print(btnBl[i] ? "BL: ON " : "BL: OFF");
+        gfx->setCursor(xo + 8, 115);
+        gfx->print(btnState[i] ? "PRESSED" : "       ");
     }
 }
 
 void drawScreenBtns() {
     for (int i = 0; i < NUM_SCREEN_BTNS; i++) {
         const ScreenBtn &b = screenBtns[i];
-        tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, b.color);
-        tft.setTextColor(TFT_BLACK);
-        tft.setTextSize(1);
-        // Centre text
+        gfx->fillRoundRect(b.x, b.y, b.w, b.h, 6, b.color);
+        gfx->setTextColor(0x0000);  // black text
+        gfx->setTextSize(1);
         int tw = strlen(b.label) * 6;
-        tft.setCursor(b.x + (b.w - tw)/2, b.y + (b.h - 8)/2);
-        tft.print(b.label);
+        gfx->setCursor(b.x + (b.w - tw)/2, b.y + (b.h - 8)/2);
+        gfx->print(b.label);
     }
 }
 
@@ -328,15 +340,14 @@ void redrawLog() {
     int y = 150;
     for (int i = 0; i < LOG_LINES; i++) {
         int idx = (logHead + i) % LOG_LINES;
-        tft.fillRect(0, y, TFT_W, 16, C_BG);
-        tft.setTextColor(C_TEXT, C_BG);
-        tft.setTextSize(1);
-        tft.setCursor(10, y + 2);
+        gfx->fillRect(0, y, TFT_W, 16, C_BG);
+        gfx->setTextColor(C_TEXT, C_BG);
+        gfx->setTextSize(1);
+        gfx->setCursor(10, y + 2);
         if (logLines[idx].length() > 0) {
-            // Truncate to fit display width
             String s = logLines[idx];
             if (s.length() > 51) s = s.substring(0, 51);
-            tft.print(s);
+            gfx->print(s);
         }
         y += 18;
     }
@@ -352,6 +363,7 @@ void handleScreenTouch(int16_t x, int16_t y) {
             if (i == 1) sendStopAll();
             if (i == 2) sendPingAll();
             if (i == 3) enter433Pairing();
+            if (i == 4) sendRS485Ping();
             break;
         }
     }
@@ -382,7 +394,10 @@ void handleRS485() {
                 if (!err) {
                     const char *type = doc["type"] | "";
 
-                    if (strcmp(type, "ping_reply") == 0) {
+                    if (strcmp(type, "rs485_pong") == 0) {
+                        String mac = doc["mac"] | "?";
+                        logAdd("SV alive: " + mac);
+                    } else if (strcmp(type, "ping_reply") == 0) {
                         String mac  = doc["mac"] | "??:??:??:??:??:??";
                         float  batt = doc["battery"] | 0.0f;
                         logAdd("Pong " + mac.substring(9) + " " + String(batt,1)+"V");
@@ -414,7 +429,6 @@ void sendBlinkAll() {
                   "\"action\":\"blink\",\"duration\":5000,\"buzzer\":true}";
     rs485Send(json);
     logAdd(">> Blink All sent");
-    // Light up all button backlights to indicate blinking
     for (int i = 0; i < 3; i++) {
         btnBl[i] = true;
         digitalWrite(BTN_BL[i], HIGH);
@@ -439,10 +453,14 @@ void sendPingAll() {
     logAdd(">> Ping All");
 }
 
+void sendRS485Ping() {
+    rs485Send("{\"type\":\"rs485_ping\"}");
+    logAdd(">> RS485 Ping");
+}
+
 void enter433Pairing() {
     pairingMode433 = true;
     logAdd("433 Pair: waiting for remote...");
-    // Flash all backlights to indicate pairing mode
     for (int i = 0; i < 3; i++) {
         digitalWrite(BTN_BL[i], HIGH);
     }

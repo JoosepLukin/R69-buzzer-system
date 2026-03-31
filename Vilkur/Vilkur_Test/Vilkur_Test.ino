@@ -25,6 +25,7 @@
 
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <RCSwitch.h>
 
 // ─── Pin definitions ─────────────────────────────────────────────────────────
@@ -81,8 +82,8 @@ void stopBlink();
 void updateBlink();
 void sendPong();
 void enable433(bool enable);
-void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len);
-void onEspNowSend(const uint8_t *mac, esp_now_send_status_t status);
+void onEspNowRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
+void onEspNowSend(const wifi_tx_info_t *tx_info, esp_now_send_status_t status);
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
@@ -372,11 +373,12 @@ void sendPong() {
 }
 
 // ─── ESP-NOW callbacks ────────────────────────────────────────────────────────
-void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+void onEspNowRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     lastEspNowMs = millis();
 
     if (len < (int)sizeof(EspNowMsg)) return;
     const EspNowMsg *msg = (const EspNowMsg*)data;
+    const uint8_t *mac = recv_info->src_addr;
 
     char macStr[18];
     snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -411,7 +413,7 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
     }
 }
 
-void onEspNowSend(const uint8_t *mac, esp_now_send_status_t status) {
+void onEspNowSend(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
     Serial.printf("[ESP-NOW] TX %s\n",
                   status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
